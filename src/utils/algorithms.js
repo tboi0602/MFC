@@ -1,6 +1,19 @@
 // src/utils/optimization.js
 
 // Haversine formula to calculate distance between two coordinates
+export function calculateDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371; // Bán kính Trái Đất (km)
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLng / 2) *
+      Math.sin(dLng / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
 
 // Calculate travel time based on distance and traffic conditions
 export function calculateTravelTime(distance, vehicleType = "motorbike") {
@@ -256,7 +269,7 @@ export function optimizeInventoryDistribution(
     }),
   };
 }
-import { getTrafficData, calculateDistance } from "../data/mockData";
+import { getTrafficData } from "../data/mockData";
 
 export const optimizeOrderAllocation = (
   customerLat,
@@ -267,6 +280,12 @@ export const optimizeOrderAllocation = (
 ) => {
   const analysis = [];
 
+  // Hệ số trọng số cho chấm điểm MFC
+  const ALPHA = 0.4; // ưu tiên tốc độ giao
+  const BETA = 0.3; // ưu tiên chi phí
+  const GAMMA = 0.2; // ưu tiên tồn kho
+  const DELTA = 0.1; // ưu tiên cân bằng tải
+
   for (const mfc of mfcsList) {
     // 1. Kiểm tra tồn kho
     const inventoryCheck = checkInventory(mfc, orderItems);
@@ -274,10 +293,10 @@ export const optimizeOrderAllocation = (
       analysis.push({
         mfc,
         scores: {
-          distance: 0,
+          eta: 0,
+          cost: 0,
           inventory: 0,
-          shipper: 0,
-          traffic: 0,
+          loadBalance: 0,
           overall: 0,
         },
         details: {
@@ -291,6 +310,8 @@ export const optimizeOrderAllocation = (
           availableShippers: mfc.shippers.filter((s) => s.isAvailable).length,
           estimatedTime: 0,
           trafficLevel: "unknown",
+          totalCost: 0,
+          currentLoad: 0,
         },
         isSelected: false,
         eliminationReason: "Không đủ hàng trong kho",
@@ -319,10 +340,10 @@ export const optimizeOrderAllocation = (
       analysis.push({
         mfc,
         scores: {
-          distance: Math.max(0, 100 - distance * 10),
+          eta: Math.max(0, 100 - distance * 10),
+          cost: 100,
           inventory: 100,
-          shipper: 0,
-          traffic: 0,
+          loadBalance: 0,
           overall: 0,
         },
         details: {
@@ -331,6 +352,8 @@ export const optimizeOrderAllocation = (
           availableShippers: 0,
           estimatedTime: 0,
           trafficLevel: "unknown",
+          totalCost: 0,
+          currentLoad: 0,
         },
         isSelected: false,
         eliminationReason: "Không có shipper khả dụng trong bán kính giao hàng",
@@ -338,7 +361,9 @@ export const optimizeOrderAllocation = (
       continue;
     }
 
-    // 3. Tính toán điểm số
+    // 3. Tính toán điểm số MFC theo công thức mới
+    // Score(MFC) = (α×ETA) + (β×Cost) + (γ×InventoryMatch) + (δ×LoadBalance)
+
     const bestShipper = availableShippers.reduce((best, current) => {
       const currentDist = calculateDistance(
         current.lat,
@@ -363,12 +388,14 @@ export const optimizeOrderAllocation = (
       customerLat,
       customerLng
     );
-    const shipperDistance = calculateDistance(
+
+    const shipperToMFCDistance = calculateDistance(
       bestShipper.lat,
       bestShipper.lng,
-      customerLat,
-      customerLng
+      mfc.lat,
+      mfc.lng
     );
+
     const trafficData = getTrafficData(
       mfc.lat,
       mfc.lng,
@@ -376,52 +403,55 @@ export const optimizeOrderAllocation = (
       customerLng
     );
 
-    const distanceScore = Math.max(0, 100 - distance * 15);
-    const inventoryScore = Math.min(100, inventoryCheck.stockLevel * 10);
-    const shipperDistanceToMFC = calculateDistance(
-      bestShipper.lat,
-      bestShipper.lng,
-      mfc.lat,
-      mfc.lng
-    );
-    const shipperScore = Math.max(0, 100 - shipperDistanceToMFC * 20);
+    // Tính ETA Score (Estimated Time of Arrival) - điểm càng cao càng nhanh
+    const totalDeliveryTime =
+      trafficData.estimatedTime +
+      mfc.avgDeliveryTime +
+      shipperToMFCDistance * 3;
+    const etaScore = Math.max(0, 100 - (totalDeliveryTime / 60) * 20); // Normalize theo giờ
 
-    let trafficScore = 100;
-    switch (trafficData.trafficLevel) {
-      case "high":
-        trafficScore = 50;
-        break;
-      case "medium":
-        trafficScore = 75;
-        break;
-      case "low":
-        trafficScore = 100;
-        break;
-    }
+    // Tính Cost Score - điểm càng cao càng rẻ
+    const fuelCost = distance * 2000; // 2000 VND/km
+    const shipperCost = bestShipper.rating * 10000; // Shipper rating cao thì cost cao
+    const totalCost = fuelCost + shipperCost;
+    const costScore = Math.max(0, 100 - (totalCost / 50000) * 20); // Normalize
 
+    // Tính Inventory Match Score - điểm dựa trên mức độ phù hợp inventory
+    const inventoryScore = Math.min(100, inventoryCheck.stockLevel * 20);
+
+    // Tính Load Balance Score - điểm dựa trên tải hiện tại của MFC
+    const currentLoadPercentage = mfc.currentLoad
+      ? (mfc.currentLoad / mfc.capacity) * 100
+      : 50;
+    const loadBalanceScore = Math.max(0, 100 - currentLoadPercentage); // MFC ít tải hơn thì điểm cao hơn
+
+    // Áp dụng công thức chấm điểm MFC
     const overallScore =
-      distanceScore * 0.3 +
-      inventoryScore * 0.25 +
-      shipperScore * 0.25 +
-      trafficScore * 0.2;
+      ALPHA * etaScore +
+      BETA * costScore +
+      GAMMA * inventoryScore +
+      DELTA * loadBalanceScore;
 
     analysis.push({
       mfc,
       scores: {
-        distance: Math.round(distanceScore),
+        eta: Math.round(etaScore),
+        cost: Math.round(costScore),
         inventory: Math.round(inventoryScore),
-        shipper: Math.round(shipperScore),
-        traffic: Math.round(trafficScore),
+        loadBalance: Math.round(loadBalanceScore),
         overall: Math.round(overallScore),
       },
       details: {
         distanceKm: Math.round(distance * 10) / 10,
         inventoryStatus: "Đủ hàng",
         availableShippers: availableShippers.length,
-        estimatedTime: trafficData.estimatedTime + mfc.avgDeliveryTime,
+        estimatedTime: Math.round(totalDeliveryTime),
         trafficLevel: getTrafficLevelText(trafficData.trafficLevel),
+        totalCost: Math.round(totalCost),
+        currentLoad: Math.round(currentLoadPercentage),
       },
       isSelected: false,
+      bestShipper: bestShipper,
     });
   }
 
@@ -435,37 +465,45 @@ export const optimizeOrderAllocation = (
   );
   bestMFC.isSelected = true;
 
-  const availableShippers = bestMFC.mfc.shippers.filter((shipper) => {
-    const shipperDistance = calculateDistance(
-      shipper.lat,
-      shipper.lng,
-      customerLat,
-      customerLng
-    );
-    return shipper.isAvailable && shipperDistance <= shipper.deliveryRadius;
-  });
+  // Chấm điểm tuyến đường cho shipper được chọn
+  // Priority(Route) = (α×ETA) + (β×Cost) + (γ×LoadBalance)
+  const selectedShipper = bestMFC.bestShipper;
 
-  const selectedShipper = availableShippers.reduce((best, current) => {
-    const currentDist = calculateDistance(
-      current.lat,
-      current.lng,
-      customerLat,
-      customerLng
-    );
-    const bestDist = calculateDistance(
-      best.lat,
-      best.lng,
-      customerLat,
-      customerLng
-    );
-    const currentScore = (10 - currentDist) * 10 + current.rating * 10;
-    const bestScore = (10 - bestDist) * 10 + best.rating * 10;
-    return currentScore > bestScore ? current : best;
-  });
+  // Tính điểm tuyến đường
+  const routeDistance = calculateDistance(
+    selectedShipper.lat,
+    selectedShipper.lng,
+    customerLat,
+    customerLng
+  );
+
+  const routeTrafficData = getTrafficData(
+    selectedShipper.lat,
+    selectedShipper.lng,
+    customerLat,
+    customerLng
+  );
+
+  const routeETA = routeTrafficData.estimatedTime;
+  const routeETAScore = Math.max(0, 100 - (routeETA / 60) * 15);
+
+  const routeCost = routeDistance * 2000 + selectedShipper.rating * 5000;
+  const routeCostScore = Math.max(0, 100 - (routeCost / 30000) * 20);
+
+  // Load balance cho route (dựa trên số đơn hàng hiện tại của shipper)
+  const shipperCurrentOrders = selectedShipper.assignedOrders
+    ? selectedShipper.assignedOrders.length
+    : 0;
+  const routeLoadBalanceScore = Math.max(0, 100 - shipperCurrentOrders * 25);
+
+  const routePriority =
+    ALPHA * routeETAScore +
+    BETA * routeCostScore +
+    GAMMA * routeLoadBalanceScore;
 
   const route = [
-    [bestMFC.mfc.lat, bestMFC.mfc.lng],
     [selectedShipper.lat, selectedShipper.lng],
+    [bestMFC.mfc.lat, bestMFC.mfc.lng],
     [customerLat, customerLng],
   ];
 
@@ -473,9 +511,28 @@ export const optimizeOrderAllocation = (
     selectedMFC: bestMFC.mfc,
     selectedShipper,
     totalScore: bestMFC.scores.overall,
+    routePriority: Math.round(routePriority),
     estimatedDeliveryTime: bestMFC.details.estimatedTime,
+    totalCost: bestMFC.details.totalCost,
     route,
     analysis: analysis.sort((a, b) => b.scores.overall - a.scores.overall),
+    algorithmDetails: {
+      mfcFormula:
+        "Score(MFC) = (α×ETA) + (β×Cost) + (γ×InventoryMatch) + (δ×LoadBalance)",
+      routeFormula: "Priority(Route) = (α×ETA) + (β×Cost) + (γ×LoadBalance)",
+      weights: {
+        alpha: ALPHA,
+        beta: BETA,
+        gamma: GAMMA,
+        delta: DELTA,
+      },
+      routeAnalysis: {
+        etaScore: Math.round(routeETAScore),
+        costScore: Math.round(routeCostScore),
+        loadBalanceScore: Math.round(routeLoadBalanceScore),
+        finalPriority: Math.round(routePriority),
+      },
+    },
   };
 };
 
